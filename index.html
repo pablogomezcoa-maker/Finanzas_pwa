@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Mis Finanzas</title>
+
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#0E1512" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Finanzas" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<link rel="icon" href="./icon-192.png" />
+
+<style>
+  html, body { margin: 0; padding: 0; background: #0E1512; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useCallback } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import {
+  Plus, CreditCard, Calendar, Wallet, BarChart3, ArrowLeft,
+  TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, Trash2,
+  Landmark, Settings
+} from "https://esm.sh/lucide-react@0.383.0?deps=react@18.2.0";
+
+/* ---------------------------------------------------------
+   Almacenamiento local (en el propio celular)
+--------------------------------------------------------- */
+const STORAGE_KEY = 'finanzas-data';
+
+const defaultData = {
+  account: { balance: 0 },
+  card: { limit: 0, closingDay: null, dueDay: 5 },
+  purchases: [],
+};
+
+async function loadData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function saveData(next) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // almacenamiento no disponible; se mantiene en memoria
+  }
+}
+
+/* ---------------------------------------------------------
+   Utilidades de fecha / dinero
+--------------------------------------------------------- */
+function formatCLP(n) {
+  return new Intl.NumberFormat('es-CL', {
+    style: 'currency',
+    currency: 'CLP',
+    maximumFractionDigits: 0,
+  }).format(Math.round(n || 0));
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function parseDate(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return { y, m: m - 1, d };
+}
+
+function monthsBetween(y1, m1, y2, m2) {
+  return (y2 - y1) * 12 + (m2 - m1);
+}
+
+const NOMBRES_MES = [
+  'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+  'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre',
+];
+
+// Determina a qué ciclo de facturación pertenece una fecha, según el día de cierre.
+// Si la compra es posterior al cierre, cae en la boleta del mes siguiente.
+function cycleMonth(iso, closingDay) {
+  const { y, m, d } = parseDate(iso);
+  const effClosing = closingDay || 28; // referencia: la mayoría de las tarjetas cierran entre el 26 y el 30
+  if (d > effClosing) {
+    let ny = y, nm = m + 1;
+    if (nm > 11) { nm = 0; ny += 1; }
+    return { y: ny, m: nm };
+  }
+  return { y, m };
+}
+
+function currentCycle(closingDay) {
+  return cycleMonth(todayISO(), closingDay);
+}
+
+// El ciclo que "está en pago" no es el de hoy, sino aquel cuyo vencimiento es el próximo
+// vencimiento pendiente. Entre el cierre y el pago, la boleta ya cerró pero aún no se paga.
+function cycleForDueDate(dueDate, closingDay, dueDay) {
+  const effClosing = closingDay || 28;
+  let y = dueDate.getFullYear();
+  let m = dueDate.getMonth();
+  if ((dueDay || 5) <= effClosing) {
+    m -= 1;
+    if (m < 0) { m = 11; y -= 1; }
+  }
+  return { y, m };
+}
+
+function currentBillingCycle(closingDay, dueDay) {
+  const { date } = nextDueDate(dueDay || 5);
+  return cycleForDueDate(date, closingDay, dueDay);
+}
+
+function installmentInfo(p, refY, refM, closingDay) {
+  const { y, m } = p.method === 'credito' ? cycleMonth(p.date, closingDay) : parseDate(p.date);
+  const n = p.method === 'credito' ? Math.max(1, p.installments || 1) : 1;
+  const elapsed = monthsBetween(y, m, refY, refM);
+  const active = elapsed >= 0 && elapsed < n;
+  const cuotaAmount = p.amount / n;
+  return { active, cuotaAmount, cuotaNumber: elapsed + 1, n, elapsed };
+}
+
+// calY/calM: mes calendario real (para gastos con cuenta corriente)
+// cycleY/cycleM: ciclo de facturación de la tarjeta (para gastos con crédito)
+function gastoDelMes(purchases, calY, calM, cycleY, cycleM, closingDay) {
+  let total = 0;
+  purchases.forEach((p) => {
+    if (p.method === 'debito') {
+      const { y, m } = parseDate(p.date);
+      if (y === calY && m === calM) total += p.amount;
+    } else {
+      const info = installmentInfo(p, cycleY, cycleM, closingDay);
+      if (info.active) total += info.cuotaAmount;
+    }
+  });
+  return total;
+}
+
+function deudaTarjeta(purchases, cycleY, cycleM, closingDay) {
+  let total = 0;
+  purchases.forEach((p) => {
+    if (p.method !== 'credito') return;
+    const info = installmentInfo(p, cycleY, cycleM, closingDay);
+    if (info.elapsed < 0) {
+      total += p.amount;
+      return;
+    }
+    const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+    const restantes = info.n - pagadas;
+    total += restantes * info.cuotaAmount;
+  });
+  return total;
+}
+
+function nextDueDate(dueDay) {
+  const now = new Date();
+  let y = now.getFullYear();
+  let m = now.getMonth();
+  let due = new Date(y, m, dueDay);
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (due < startOfToday) {
+    m += 1;
+    due = new Date(y, m, dueDay);
+  }
+  const days = Math.round((due.getTime() - startOfToday.getTime()) / 86400000);
+  return { date: due, days };
+}
+
+function requestNotificationPermission() {
+  if (!('Notification' in window)) return Promise.resolve('unsupported');
+  return Notification.requestPermission();
+}
+
+function maybeNotify(days, dueDateLabel) {
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const today = todayISO();
+    const lastNotified = localStorage.getItem('finanzas-last-notif');
+    if (lastNotified === today) return; // ya avisamos hoy
+    if (days <= 5) {
+      new Notification('Tu tarjeta está por vencer', {
+        body: days <= 0
+          ? 'La tarjeta vence hoy.'
+          : `Faltan ${days} día${days === 1 ? '' : 's'} para el vencimiento (${dueDateLabel}).`,
+        icon: './icon-192.png',
+        tag: 'finanzas-vencimiento',
+      });
+      localStorage.setItem('finanzas-last-notif', today);
+    }
+  } catch (e) {
+    // notificaciones no disponibles
+  }
+}
+
+/* ---------------------------------------------------------
+   Estilos globales / tokens
+--------------------------------------------------------- */
+const GlobalStyle = () => (
+  <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600;700&display=swap');
+
+    .fz-root {
+      --bg: #0E1512;
+      --surface: #161F1B;
+      --surface-2: #1E2A24;
+      --border: #2A3830;
+      --text: #EDEFEA;
+      --text-dim: #8FA096;
+      --accent: #37D6A0;
+      --accent-soft: rgba(55,214,160,0.14);
+      --danger: #FF6161;
+      --danger-soft: rgba(255,97,97,0.14);
+      --amber: #F0B429;
+      --amber-soft: rgba(240,180,41,0.14);
+
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      min-height: 100vh;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .fz-root * { box-sizing: border-box; }
+    .fz-display { font-family: 'JetBrains Mono', monospace; font-weight: 600; letter-spacing: -0.02em; }
+    .fz-head { font-family: 'Space Grotesk', sans-serif; font-weight: 600; }
+    .fz-btn {
+      border: none; cursor: pointer; font-family: 'Inter', sans-serif;
+      transition: transform .12s ease, filter .12s ease;
+    }
+    .fz-btn:active { transform: scale(0.97); }
+    .fz-btn:hover { filter: brightness(1.08); }
+    .fz-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+    }
+    @keyframes fz-pulse-red {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,97,97,0.35); }
+      50% { box-shadow: 0 0 0 10px rgba(255,97,97,0); }
+    }
+    @keyframes fz-pulse-green {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(55,214,160,0.30); }
+      50% { box-shadow: 0 0 0 10px rgba(55,214,160,0); }
+    }
+    input[type=number]::-webkit-inner-spin-button { opacity: 0.5; }
+  `}</style>
+);
+
+/* ---------------------------------------------------------
+   Componentes pequeños
+--------------------------------------------------------- */
+function TopBar({ title, onBack }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 12,
+      padding: '18px 20px', position: 'sticky', top: 0,
+      background: 'var(--bg)', zIndex: 10, borderBottom: '1px solid var(--border)',
+    }}>
+      {onBack ? (
+        <button className="fz-btn" onClick={onBack} style={{
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: 10, width: 38, height: 38, display: 'flex',
+          alignItems: 'center', justifyContent: 'center', color: 'var(--text)',
+        }}>
+          <ArrowLeft size={18} />
+        </button>
+      ) : (
+        <div style={{
+          width: 38, height: 38, borderRadius: 10, background: 'var(--accent-soft)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <Landmark size={19} color="var(--accent)" />
+        </div>
+      )}
+      <div className="fz-head" style={{ fontSize: 19 }}>{title}</div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, icon: Icon, tone = 'default' }) {
+  const toneMap = {
+    default: { bg: 'var(--surface)', accent: 'var(--text-dim)' },
+    good: { bg: 'var(--accent-soft)', accent: 'var(--accent)' },
+    bad: { bg: 'var(--danger-soft)', accent: 'var(--danger)' },
+    warn: { bg: 'var(--amber-soft)', accent: 'var(--amber)' },
+  };
+  const t = toneMap[tone];
+  return (
+    <div className="fz-card" style={{ padding: '16px 16px', minHeight: 96 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        {Icon && (
+          <div style={{
+            width: 26, height: 26, borderRadius: 8, background: t.bg,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Icon size={14} color={t.accent} />
+          </div>
+        )}
+        <div style={{ fontSize: 12.5, color: 'var(--text-dim)' }}>{label}</div>
+      </div>
+      <div className="fz-display" style={{ fontSize: 21 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function BigButton({ icon: Icon, label, sub, onClick, accent }) {
+  return (
+    <button className="fz-btn fz-card" onClick={onClick} style={{
+      display: 'flex', alignItems: 'center', gap: 14, padding: '16px 16px',
+      width: '100%', textAlign: 'left', color: 'var(--text)',
+    }}>
+      <div style={{
+        width: 46, height: 46, borderRadius: 12, background: accent + '22',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+      }}>
+        <Icon size={22} color={accent} />
+      </div>
+      <div>
+        <div className="fz-head" style={{ fontSize: 15.5 }}>{label}</div>
+        {sub && <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginTop: 2 }}>{sub}</div>}
+      </div>
+    </button>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 6 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: '100%', padding: '12px 14px', borderRadius: 10,
+  border: '1px solid var(--border)', background: 'var(--surface-2)',
+  color: 'var(--text)', fontSize: 15, fontFamily: 'Inter, sans-serif', outline: 'none',
+};
+
+/* ---------------------------------------------------------
+   Vistas
+--------------------------------------------------------- */
+function HomeView({ data, setView }) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const lastM = m === 0 ? 11 : m - 1;
+  const lastY = m === 0 ? y - 1 : y;
+  const closingDay = data.card.closingDay;
+  const cyc = currentBillingCycle(closingDay, data.card.dueDay);
+  const lastCycM = cyc.m === 0 ? 11 : cyc.m - 1;
+  const lastCycY = cyc.m === 0 ? cyc.y - 1 : cyc.y;
+
+  const gastoMesActual = gastoDelMes(data.purchases, y, m, cyc.y, cyc.m, closingDay);
+  const gastoMesPasado = gastoDelMes(data.purchases, lastY, lastM, lastCycY, lastCycM, closingDay);
+  const deuda = deudaTarjeta(data.purchases, cyc.y, cyc.m, closingDay);
+  const cupoDisp = data.card.limit - deuda;
+  const disponibleReal = data.account.balance - deuda;
+  const { days, date } = nextDueDate(data.card.dueDay || 5);
+  const rojo = days <= 5;
+
+  const diffPct = gastoMesPasado > 0
+    ? Math.round(((gastoMesActual - gastoMesPasado) / gastoMesPasado) * 100)
+    : null;
+
+  return (
+    <div style={{ padding: '18px 16px 100px' }}>
+      <div style={{
+        borderRadius: 18, padding: '18px 18px',
+        background: rojo ? 'var(--danger-soft)' : 'var(--accent-soft)',
+        border: `1px solid ${rojo ? 'var(--danger)' : 'var(--accent)'}`,
+        display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18,
+        animation: `${rojo ? 'fz-pulse-red' : 'fz-pulse-green'} 2.4s ease-in-out infinite`,
+      }}>
+        <div style={{
+          width: 44, height: 44, borderRadius: '50%',
+          background: rojo ? 'var(--danger)' : 'var(--accent)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+        }}>
+          {rojo ? <AlertTriangle size={22} color="#0E1512" /> : <CheckCircle2 size={22} color="#0E1512" />}
+        </div>
+        <div>
+          <div className="fz-head" style={{ fontSize: 16, color: rojo ? 'var(--danger)' : 'var(--accent)' }}>
+            {rojo ? '¡Vencimiento próximo!' : 'Estás al día'}
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 2 }}>
+            {days <= 0
+              ? 'La tarjeta vence hoy'
+              : `Faltan ${days} día${days === 1 ? '' : 's'} · vence el ${date.getDate()} de ${NOMBRES_MES[date.getMonth()]}`}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
+        <StatCard label="Saldo cuenta corriente" value={formatCLP(data.account.balance)} icon={Wallet} tone="default" />
+        <StatCard label="Disponible real" value={formatCLP(disponibleReal)} sub="tras descontar cuotas futuras" icon={BarChart3} tone={disponibleReal < 0 ? 'bad' : 'good'} />
+        <StatCard label="Usado en tarjeta" value={formatCLP(deuda)} sub={`Cupo libre: ${formatCLP(cupoDisp)}`} icon={CreditCard} tone={cupoDisp < 0 ? 'bad' : 'default'} />
+        <StatCard label="Próximo vencimiento" value={`${date.getDate()} ${NOMBRES_MES[date.getMonth()].slice(0, 3)}`} sub={`en ${days} día${days === 1 ? '' : 's'}`} icon={Calendar} tone={rojo ? 'bad' : 'default'} />
+        <StatCard label="Comprometido este mes" value={formatCLP(gastoMesActual)} sub="débito ya pagado + cuota de tarjeta de esta boleta" icon={TrendingUp} tone="default" />
+        <StatCard
+          label="Comprometido mes anterior"
+          value={formatCLP(gastoMesPasado)}
+          sub={diffPct !== null ? `${diffPct >= 0 ? '+' : ''}${diffPct}% vs. mes pasado` : null}
+          icon={TrendingDown}
+          tone="default"
+        />
+      </div>
+      <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginBottom: 18, marginTop: -8, padding: '0 4px' }}>
+        La parte de tarjeta es lo que corresponde a esa boleta, aunque aún no la hayas pagado.
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <BigButton icon={Plus} label="Registrar compra" sub="Anota un gasto en 30 segundos" accent="#37D6A0" onClick={() => setView('add')} />
+        <BigButton icon={Wallet} label="Movimientos de cuenta corriente" sub="Registro de todo lo gastado este mes" accent="#8FA096" onClick={() => setView('movements')} />
+        <BigButton icon={CreditCard} label="Ver estado de la tarjeta" sub="Cupo, deuda y compras activas" accent="#F0B429" onClick={() => setView('card')} />
+        <BigButton icon={Calendar} label="Ver cuotas pendientes" sub="Todas tus compras en cuotas" accent="#37D6A0" onClick={() => setView('installments')} />
+        <BigButton icon={Wallet} label="Cuentas por pagar del mes" sub="Lo que se te viene este ciclo" accent="#F0B429" onClick={() => setView('bills')} />
+        <BigButton icon={BarChart3} label="Resumen financiero" sub="Este mes vs. el anterior" accent="#37D6A0" onClick={() => setView('summary')} />
+        <BigButton icon={Settings} label="Configurar cuenta y tarjeta" sub="Saldo, cupo y día de pago" accent="#8FA096" onClick={() => setView('settings')} />
+      </div>
+    </div>
+  );
+}
+
+function AddPurchaseView({ data, updateData, setView }) {
+  const [desc, setDesc] = useState('');
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayISO());
+  const [method, setMethod] = useState('debito');
+  const [installments, setInstallments] = useState('1');
+
+  const canSave = desc.trim() && Number(amount) > 0;
+
+  const save = () => {
+    if (!canSave) return;
+    const purchase = {
+      id: Date.now().toString(),
+      desc: desc.trim(),
+      amount: Number(amount),
+      date,
+      method,
+      installments: method === 'credito' ? Math.max(1, Number(installments) || 1) : 1,
+    };
+    const next = { ...data, purchases: [purchase, ...data.purchases] };
+    if (method === 'debito') {
+      next.account = { ...data.account, balance: data.account.balance - Number(amount) };
+    }
+    updateData(next);
+    setView('home');
+  };
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <Field label="¿Qué compraste?">
+        <input style={inputStyle} placeholder="Ej: Supermercado, bencina, arriendo…" value={desc} onChange={(e) => setDesc(e.target.value)} />
+      </Field>
+      <Field label="Monto total">
+        <input style={inputStyle} type="number" inputMode="numeric" placeholder="0" value={amount} onChange={(e) => setAmount(e.target.value)} />
+      </Field>
+      <Field label="Fecha">
+        <input style={inputStyle} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+      </Field>
+      <Field label="Medio de pago">
+        <div style={{ display: 'flex', gap: 10 }}>
+          {[
+            { id: 'debito', label: 'Cuenta corriente' },
+            { id: 'credito', label: 'Tarjeta de crédito' },
+          ].map((opt) => (
+            <button
+              key={opt.id}
+              className="fz-btn"
+              onClick={() => setMethod(opt.id)}
+              style={{
+                flex: 1, padding: '12px 10px', borderRadius: 10,
+                border: `1px solid ${method === opt.id ? 'var(--accent)' : 'var(--border)'}`,
+                background: method === opt.id ? 'var(--accent-soft)' : 'var(--surface-2)',
+                color: method === opt.id ? 'var(--accent)' : 'var(--text)', fontSize: 13.5,
+              }}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </Field>
+      {method === 'credito' && (
+        <Field label="Número de cuotas">
+          <input style={inputStyle} type="number" inputMode="numeric" min="1" value={installments} onChange={(e) => setInstallments(e.target.value)} />
+        </Field>
+      )}
+      <button
+        className="fz-btn"
+        onClick={save}
+        disabled={!canSave}
+        style={{
+          width: '100%', padding: '16px', borderRadius: 12, marginTop: 8,
+          background: canSave ? 'var(--accent)' : 'var(--surface-2)',
+          color: canSave ? '#0E1512' : 'var(--text-dim)', fontSize: 16, fontWeight: 600,
+        }}
+      >
+        Guardar compra
+      </button>
+    </div>
+  );
+}
+
+function MovementsView({ data, updateData }) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const movimientos = data.purchases
+    .filter((p) => p.method === 'debito')
+    .filter((p) => {
+      const { y: py, m: pm } = parseDate(p.date);
+      return py === y && pm === m;
+    })
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const total = movimientos.reduce((s, p) => s + p.amount, 0);
+  const remove = (id) => updateData({ ...data, purchases: data.purchases.filter((p) => p.id !== id) });
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <div className="fz-card" style={{ padding: 20, marginBottom: 18 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 4 }}>Total gastado este mes (cuenta corriente)</div>
+        <div className="fz-display" style={{ fontSize: 28 }}>{formatCLP(total)}</div>
+      </div>
+
+      <div className="fz-head" style={{ fontSize: 15, marginBottom: 10 }}>Movimientos del mes</div>
+      {movimientos.length === 0 && (
+        <div style={{ color: 'var(--text-dim)', fontSize: 13.5 }}>Aún no registras gastos de cuenta corriente este mes.</div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {movimientos.map((p) => (
+          <div key={p.id} className="fz-card" style={{ padding: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 500 }}>{p.desc}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 3 }}>
+                {p.date.split('-').reverse().join('/')}
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div className="fz-display" style={{ fontSize: 14 }}>{formatCLP(p.amount)}</div>
+              <button className="fz-btn" onClick={() => remove(p.id)} style={{ background: 'transparent', color: 'var(--text-dim)', padding: 6 }}>
+                <Trash2 size={16} />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CardView({ data, updateData }) {
+  const closingDay = data.card.closingDay;
+  const { y, m } = currentBillingCycle(closingDay, data.card.dueDay);
+  const deuda = deudaTarjeta(data.purchases, y, m, closingDay);
+  const cupoDisp = data.card.limit - deuda;
+  const pct = data.card.limit > 0 ? Math.min(100, Math.round((deuda / data.card.limit) * 100)) : 0;
+  const { days, date } = nextDueDate(data.card.dueDay || 5);
+  const activas = data.purchases.filter((p) => {
+    if (p.method !== 'credito') return false;
+    const info = installmentInfo(p, y, m, closingDay);
+    const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+    return info.n - pagadas > 0;
+  });
+
+  const remove = (id) => updateData({ ...data, purchases: data.purchases.filter((p) => p.id !== id) });
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <div className="fz-card" style={{ padding: 20, marginBottom: 18 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 4 }}>Usado del cupo</div>
+        <div className="fz-display" style={{ fontSize: 28, marginBottom: 10 }}>{formatCLP(deuda)}</div>
+        <div style={{ height: 8, borderRadius: 6, background: 'var(--surface-2)', overflow: 'hidden', marginBottom: 8 }}>
+          <div style={{
+            height: '100%', width: `${pct}%`,
+            background: pct > 85 ? 'var(--danger)' : pct > 60 ? 'var(--amber)' : 'var(--accent)',
+          }} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, color: 'var(--text-dim)' }}>
+          <span>Cupo total: {formatCLP(data.card.limit)}</span>
+          <span>Disponible: {formatCLP(cupoDisp)}</span>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
+        <StatCard label="Próximo vencimiento" value={`${date.getDate()} ${NOMBRES_MES[date.getMonth()].slice(0, 3)}`} icon={Calendar} tone={days <= 5 ? 'bad' : 'default'} />
+        <StatCard label="Días restantes" value={days} icon={AlertTriangle} tone={days <= 5 ? 'bad' : 'good'} />
+      </div>
+
+      <div className="fz-head" style={{ fontSize: 15, marginBottom: 10 }}>Compras activas en la tarjeta</div>
+      {activas.length === 0 && (
+        <div style={{ color: 'var(--text-dim)', fontSize: 13.5 }}>No tienes compras a crédito pendientes.</div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {activas.map((p) => {
+          const info = installmentInfo(p, y, m, closingDay);
+          return (
+            <div key={p.id} className="fz-card" style={{ padding: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 500 }}>{p.desc}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 3 }}>
+                  Cuota {Math.min(info.cuotaNumber, info.n)} de {info.n} · {formatCLP(info.cuotaAmount)}/mes
+                </div>
+              </div>
+              <button className="fz-btn" onClick={() => remove(p.id)} style={{ background: 'transparent', color: 'var(--text-dim)', padding: 6 }}>
+                <Trash2 size={16} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function InstallmentsView({ data, updateData }) {
+  const closingDay = data.card.closingDay;
+  const { y, m } = currentBillingCycle(closingDay, data.card.dueDay);
+  const creditos = data.purchases.filter((p) => p.method === 'credito');
+  const remove = (id) => updateData({ ...data, purchases: data.purchases.filter((p) => p.id !== id) });
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      {creditos.length === 0 && (
+        <div style={{ color: 'var(--text-dim)', fontSize: 13.5, textAlign: 'center', marginTop: 40 }}>
+          Aún no registras compras en cuotas.
+        </div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {creditos.map((p) => {
+          const info = installmentInfo(p, y, m, closingDay);
+          const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+          const restantes = info.n - pagadas;
+          const pct = Math.round((pagadas / info.n) * 100);
+          return (
+            <div key={p.id} className="fz-card" style={{ padding: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 14.5, fontWeight: 500 }}>{p.desc}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 2 }}>
+                    {formatCLP(p.amount)} total · {formatCLP(info.cuotaAmount)}/cuota
+                  </div>
+                </div>
+                <button className="fz-btn" onClick={() => remove(p.id)} style={{ background: 'transparent', color: 'var(--text-dim)', padding: 6, height: 'fit-content' }}>
+                  <Trash2 size={16} />
+                </button>
+              </div>
+              <div style={{ height: 7, borderRadius: 5, background: 'var(--surface-2)', overflow: 'hidden', marginBottom: 6 }}>
+                <div style={{ height: '100%', width: `${pct}%`, background: restantes === 0 ? 'var(--accent)' : 'var(--amber)' }} />
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+                {restantes === 0 ? 'Pagada por completo' : `${pagadas} de ${info.n} cuotas pagadas · quedan ${restantes}`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function proyeccionMeses(purchases, closingDay, dueDay, cantidadMeses) {
+  const start = currentBillingCycle(closingDay, dueDay);
+  const meses = [];
+  for (let i = 0; i < cantidadMeses; i++) {
+    let y = start.y;
+    let m = start.m + i;
+    while (m > 11) { m -= 12; y += 1; }
+    const total = purchases
+      .filter((p) => p.method === 'credito')
+      .reduce((s, p) => {
+        const info = installmentInfo(p, y, m, closingDay);
+        return s + (info.active ? info.cuotaAmount : 0);
+      }, 0);
+    meses.push({ y, m, total });
+  }
+  return meses;
+}
+
+function BillsView({ data }) {
+  const closingDay = data.card.closingDay;
+  const { y, m } = currentBillingCycle(closingDay, data.card.dueDay);
+  const { days, date } = nextDueDate(data.card.dueDay || 5);
+  const items = data.purchases
+    .filter((p) => p.method === 'credito' && installmentInfo(p, y, m, closingDay).active)
+    .map((p) => ({ p, info: installmentInfo(p, y, m, closingDay) }));
+  const totalTarjeta = items.reduce((s, it) => s + it.info.cuotaAmount, 0);
+  const proyeccion = proyeccionMeses(data.purchases, closingDay, data.card.dueDay, 4);
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <div className="fz-card" style={{
+        padding: 20, marginBottom: 20,
+        border: `1px solid ${days <= 5 ? 'var(--danger)' : 'var(--border)'}`,
+      }}>
+        <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 4 }}>
+          Total a pagar el {date.getDate()} de {NOMBRES_MES[date.getMonth()]}
+        </div>
+        <div className="fz-display" style={{ fontSize: 30, color: days <= 5 ? 'var(--danger)' : 'var(--text)' }}>
+          {formatCLP(totalTarjeta)}
+        </div>
+        <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginTop: 4 }}>
+          Faltan {days} día{days === 1 ? '' : 's'} para el vencimiento
+        </div>
+      </div>
+
+      <div className="fz-head" style={{ fontSize: 15, marginBottom: 10 }}>Próximos 4 meses</div>
+      <div className="fz-card" style={{ padding: 14, marginBottom: 20, display: 'flex', justifyContent: 'space-between' }}>
+        {proyeccion.map((pm, idx) => (
+          <div key={idx} style={{ textAlign: 'center', flex: 1 }}>
+            <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginBottom: 6, textTransform: 'capitalize' }}>
+              {NOMBRES_MES[pm.m].slice(0, 3)}
+            </div>
+            <div className="fz-display" style={{ fontSize: 12.5 }}>{formatCLP(pm.total)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="fz-head" style={{ fontSize: 15, marginBottom: 10 }}>Detalle del cargo</div>
+      {items.length === 0 && (
+        <div style={{ color: 'var(--text-dim)', fontSize: 13.5 }}>No tienes cuotas de tarjeta este mes.</div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {items.map(({ p, info }) => (
+          <div key={p.id} className="fz-card" style={{ padding: 14, display: 'flex', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: 14 }}>{p.desc}</div>
+            <div className="fz-display" style={{ fontSize: 14 }}>{formatCLP(info.cuotaAmount)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SummaryView({ data }) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const lastM = m === 0 ? 11 : m - 1;
+  const lastY = m === 0 ? y - 1 : y;
+  const closingDay = data.card.closingDay;
+  const cyc = currentBillingCycle(closingDay, data.card.dueDay);
+  const lastCycM = cyc.m === 0 ? 11 : cyc.m - 1;
+  const lastCycY = cyc.m === 0 ? cyc.y - 1 : cyc.y;
+  const actual = gastoDelMes(data.purchases, y, m, cyc.y, cyc.m, closingDay);
+  const pasado = gastoDelMes(data.purchases, lastY, lastM, lastCycY, lastCycM, closingDay);
+  const deuda = deudaTarjeta(data.purchases, cyc.y, cyc.m, closingDay);
+  const disponibleReal = data.account.balance - deuda;
+  const maxVal = Math.max(actual, pasado, 1);
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <div className="fz-card" style={{ padding: 20, marginBottom: 18 }}>
+        <div className="fz-head" style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-dim)' }}>
+          Gasto mensual comparado
+        </div>
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 24, height: 140, marginBottom: 8 }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+            <div className="fz-display" style={{ fontSize: 12.5, color: 'var(--text-dim)' }}>{formatCLP(pasado)}</div>
+            <div style={{
+              width: '55%', height: `${Math.max(6, (pasado / maxVal) * 100)}px`,
+              background: 'var(--surface-2)', borderRadius: '6px 6px 0 0',
+            }} />
+            <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{NOMBRES_MES[lastM].slice(0, 3)}</div>
+          </div>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+            <div className="fz-display" style={{ fontSize: 12.5, color: 'var(--accent)' }}>{formatCLP(actual)}</div>
+            <div style={{
+              width: '55%', height: `${Math.max(6, (actual / maxVal) * 100)}px`,
+              background: 'var(--accent)', borderRadius: '6px 6px 0 0',
+            }} />
+            <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{NOMBRES_MES[m].slice(0, 3)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <StatCard label="Saldo actual" value={formatCLP(data.account.balance)} icon={Wallet} />
+        <StatCard label="Deuda en tarjeta" value={formatCLP(deuda)} icon={CreditCard} tone={deuda > 0 ? 'warn' : 'default'} />
+        <StatCard label="Disponible real" value={formatCLP(disponibleReal)} icon={BarChart3} tone={disponibleReal < 0 ? 'bad' : 'good'} />
+        <StatCard
+          label="Variación mensual"
+          value={pasado > 0 ? `${Math.round(((actual - pasado) / pasado) * 100)}%` : '—'}
+          icon={actual >= pasado ? TrendingUp : TrendingDown}
+          tone={actual > pasado ? 'bad' : 'good'}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ data, updateData, setView }) {
+  const [balance, setBalance] = useState(String(data.account.balance || ''));
+  const [limit, setLimit] = useState(String(data.card.limit || ''));
+  const [closingDay, setClosingDay] = useState(String(data.card.closingDay || ''));
+  const [dueDay, setDueDay] = useState(String(data.card.dueDay || 5));
+
+  const save = () => {
+    updateData({
+      ...data,
+      account: { balance: Number(balance) || 0 },
+      card: {
+        limit: Number(limit) || 0,
+        closingDay: closingDay ? Math.min(31, Math.max(1, Number(closingDay))) : null,
+        dueDay: Math.min(28, Math.max(1, Number(dueDay) || 1)),
+      },
+    });
+    setView('home');
+  };
+
+  return (
+    <div style={{ padding: '18px 16px 40px' }}>
+      <Field label="Saldo actual de tu cuenta corriente">
+        <input style={inputStyle} type="number" inputMode="numeric" value={balance} onChange={(e) => setBalance(e.target.value)} />
+      </Field>
+      <Field label="Cupo total de tu tarjeta de crédito">
+        <input style={inputStyle} type="number" inputMode="numeric" value={limit} onChange={(e) => setLimit(e.target.value)} />
+      </Field>
+      <Field label="Día de cierre de facturación (opcional)">
+        <input style={inputStyle} type="number" inputMode="numeric" min="1" max="31" placeholder="Ej: 20" value={closingDay} onChange={(e) => setClosingDay(e.target.value)} />
+        <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
+          Las compras hechas después de este día se agrupan en la boleta del mes siguiente. Si lo dejas vacío, usamos el 28 como referencia. Puede variar 1 o 2 días según el mes (feriados, fines de semana); si notas una diferencia, ajústalo aquí con el día exacto de tu cartola.
+        </div>
+      </Field>
+      <Field label="Día del mes en que vence el pago">
+        <input style={inputStyle} type="number" inputMode="numeric" min="1" max="28" value={dueDay} onChange={(e) => setDueDay(e.target.value)} />
+      </Field>
+      <button
+        className="fz-btn"
+        onClick={save}
+        style={{ width: '100%', padding: '16px', borderRadius: 12, marginTop: 8, background: 'var(--accent)', color: '#0E1512', fontSize: 16, fontWeight: 600 }}
+      >
+        Guardar cambios
+      </button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   App principal
+--------------------------------------------------------- */
+const VIEW_TITLES = {
+  home: 'Mis finanzas',
+  add: 'Registrar compra',
+  movements: 'Cuenta corriente',
+  card: 'Estado de la tarjeta',
+  installments: 'Cuotas pendientes',
+  bills: 'Cuentas por pagar',
+  summary: 'Resumen financiero',
+  settings: 'Configuración',
+};
+
+function FinanzasApp() {
+  const [data, setData] = useState(defaultData);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState('home');
+  const [needsSetup, setNeedsSetup] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const parsed = await loadData();
+      if (parsed) {
+        setData({ ...defaultData, ...parsed });
+      } else {
+        setNeedsSetup(true);
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  const updateData = useCallback(async (next) => {
+    setData(next);
+    await saveData(next);
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="fz-root" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+        <GlobalStyle />
+        <div style={{ color: 'var(--text-dim)', fontSize: 14 }}>Cargando…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fz-root" style={{ maxWidth: 480, margin: '0 auto', position: 'relative' }}>
+      <GlobalStyle />
+      <TopBar title={VIEW_TITLES[view]} onBack={view !== 'home' ? () => setView('home') : null} />
+
+      {needsSetup && view === 'home' && (
+        <div style={{ padding: '14px 16px 0' }}>
+          <div className="fz-card" style={{
+            padding: 14, display: 'flex', alignItems: 'center', gap: 10,
+            border: '1px solid var(--amber)', background: 'var(--amber-soft)',
+          }}>
+            <AlertTriangle size={18} color="var(--amber)" />
+            <div style={{ fontSize: 13 }}>
+              Configura tu saldo y tu tarjeta para empezar.{' '}
+              <button className="fz-btn" onClick={() => { setNeedsSetup(false); setView('settings'); }} style={{
+                background: 'transparent', color: 'var(--amber)', textDecoration: 'underline', padding: 0, fontSize: 13,
+              }}>
+                Ir a configuración
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {view === 'home' && <HomeView data={data} setView={setView} />}
+      {view === 'add' && <AddPurchaseView data={data} updateData={updateData} setView={setView} />}
+      {view === 'movements' && <MovementsView data={data} updateData={updateData} />}
+      {view === 'card' && <CardView data={data} updateData={updateData} />}
+      {view === 'installments' && <InstallmentsView data={data} updateData={updateData} />}
+      {view === 'bills' && <BillsView data={data} />}
+      {view === 'summary' && <SummaryView data={data} />}
+      {view === 'settings' && <SettingsView data={data} updateData={updateData} setView={setView} />}
+    </div>
+  );
+}
+
+createRoot(document.getElementById('root')).render(<FinanzasApp />);
+</script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
