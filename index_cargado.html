@@ -1,0 +1,1848 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Mis Finanzas</title>
+
+<link rel="manifest" href="./manifest.json" />
+<meta name="theme-color" content="#0E1512" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Finanzas" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<link rel="icon" href="./icon-192.png" />
+
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #0E1512;
+    width: 100%; max-width: 100vw; overflow-x: hidden;
+    -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+  }
+  #root { min-height: 100vh; width: 100%; max-width: 100vw; overflow-x: hidden; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import { jsx as _jsx, jsxs as _jsxs } from "https://esm.sh/react@18.2.0/jsx-runtime";
+import React, { useState, useEffect, useCallback, useRef } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import { Plus, CreditCard, Calendar, Wallet, BarChart3, ArrowLeft, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, Trash2, Landmark, Settings } from "https://esm.sh/lucide-react@0.383.0?deps=react@18.2.0";
+/* ---------------------------------------------------------
+   Almacenamiento local (en el propio celular)
+--------------------------------------------------------- */
+const STORAGE_KEY = 'finanzas-data';
+const defaultData = {
+  account: {
+    balance: 0
+  },
+  card: {
+    limit: 0,
+    closingDay: null,
+    dueDay: 5
+  },
+  purchases: []
+};
+async function loadData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+async function saveData(next) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // almacenamiento no disponible; se mantiene en memoria
+  }
+}
+
+/* ---------------------------------------------------------
+   Utilidades de fecha / dinero
+--------------------------------------------------------- */
+function formatCLP(n) {
+  return new Intl.NumberFormat('es-CL', {
+    style: 'currency',
+    currency: 'CLP',
+    maximumFractionDigits: 0
+  }).format(Math.round(n || 0));
+}
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function parseDate(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return {
+    y,
+    m: m - 1,
+    d
+  };
+}
+function monthsBetween(y1, m1, y2, m2) {
+  return (y2 - y1) * 12 + (m2 - m1);
+}
+const NOMBRES_MES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+
+// Determina a qué ciclo de facturación pertenece una fecha, según el día de cierre.
+// Si la compra es posterior al cierre, cae en la boleta del mes siguiente.
+function cycleMonth(iso, closingDay) {
+  const {
+    y,
+    m,
+    d
+  } = parseDate(iso);
+  const effClosing = closingDay || 28; // referencia: la mayoría de las tarjetas cierran entre el 26 y el 30
+  if (d > effClosing) {
+    let ny = y,
+      nm = m + 1;
+    if (nm > 11) {
+      nm = 0;
+      ny += 1;
+    }
+    return {
+      y: ny,
+      m: nm
+    };
+  }
+  return {
+    y,
+    m
+  };
+}
+function currentCycle(closingDay) {
+  return cycleMonth(todayISO(), closingDay);
+}
+
+// El ciclo que "está en pago" no es el de hoy, sino aquel cuyo vencimiento es el próximo
+// vencimiento pendiente. Entre el cierre y el pago, la boleta ya cerró pero aún no se paga.
+function cycleForDueDate(dueDate, closingDay, dueDay) {
+  const effClosing = closingDay || 28;
+  let y = dueDate.getFullYear();
+  let m = dueDate.getMonth();
+  if ((dueDay || 5) <= effClosing) {
+    m -= 1;
+    if (m < 0) {
+      m = 11;
+      y -= 1;
+    }
+  }
+  return {
+    y,
+    m
+  };
+}
+function currentBillingCycle(closingDay, dueDay) {
+  const {
+    date
+  } = nextDueDate(dueDay || 5);
+  return cycleForDueDate(date, closingDay, dueDay);
+}
+function installmentInfo(p, refY, refM, closingDay) {
+  const {
+    y,
+    m
+  } = p.method === 'credito' ? cycleMonth(p.date, closingDay) : parseDate(p.date);
+  const n = p.method === 'credito' ? Math.max(1, p.installments || 1) : 1;
+  const elapsed = monthsBetween(y, m, refY, refM);
+  const active = elapsed >= 0 && elapsed < n;
+  const cuotaAmount = p.amount / n;
+  return {
+    active,
+    cuotaAmount,
+    cuotaNumber: elapsed + 1,
+    n,
+    elapsed
+  };
+}
+
+// calY/calM: mes calendario real (para gastos con cuenta corriente)
+// cycleY/cycleM: ciclo de facturación de la tarjeta (para gastos con crédito)
+function gastoDelMes(purchases, calY, calM, cycleY, cycleM, closingDay) {
+  let total = 0;
+  purchases.forEach(p => {
+    if (p.method === 'debito') {
+      const {
+        y,
+        m
+      } = parseDate(p.date);
+      if (y === calY && m === calM) total += p.amount;
+    } else {
+      const info = installmentInfo(p, cycleY, cycleM, closingDay);
+      if (info.active) total += info.cuotaAmount;
+    }
+  });
+  return total;
+}
+function gastoDelMesDesglosado(purchases, calY, calM, cycleY, cycleM, closingDay) {
+  let debito = 0;
+  let tarjeta = 0;
+  purchases.forEach(p => {
+    if (p.method === 'debito') {
+      const {
+        y,
+        m
+      } = parseDate(p.date);
+      if (y === calY && m === calM) debito += p.amount;
+    } else {
+      const info = installmentInfo(p, cycleY, cycleM, closingDay);
+      if (info.active) tarjeta += info.cuotaAmount;
+    }
+  });
+  return {
+    debito,
+    tarjeta,
+    total: debito + tarjeta
+  };
+}
+function deudaTarjeta(purchases, cycleY, cycleM, closingDay) {
+  let total = 0;
+  purchases.forEach(p => {
+    if (p.method !== 'credito') return;
+    const info = installmentInfo(p, cycleY, cycleM, closingDay);
+    if (info.elapsed < 0) {
+      total += p.amount;
+      return;
+    }
+    const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+    const restantes = info.n - pagadas;
+    total += restantes * info.cuotaAmount;
+  });
+  return total;
+}
+function nextDueDate(dueDay) {
+  const now = new Date();
+  let y = now.getFullYear();
+  let m = now.getMonth();
+  let due = new Date(y, m, dueDay);
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (due < startOfToday) {
+    m += 1;
+    due = new Date(y, m, dueDay);
+  }
+  const days = Math.round((due.getTime() - startOfToday.getTime()) / 86400000);
+  return {
+    date: due,
+    days
+  };
+}
+function requestNotificationPermission() {
+  if (!('Notification' in window)) return Promise.resolve('unsupported');
+  return Notification.requestPermission();
+}
+function maybeNotify(days, dueDateLabel) {
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const today = todayISO();
+    const lastNotified = localStorage.getItem('finanzas-last-notif');
+    if (lastNotified === today) return; // ya avisamos hoy
+    if (days <= 5) {
+      new Notification('Tu tarjeta está por vencer', {
+        body: days <= 0 ? 'La tarjeta vence hoy.' : `Faltan ${days} día${days === 1 ? '' : 's'} para el vencimiento (${dueDateLabel}).`,
+        icon: './icon-192.png',
+        tag: 'finanzas-vencimiento'
+      });
+      localStorage.setItem('finanzas-last-notif', today);
+    }
+  } catch (e) {
+    // notificaciones no disponibles
+  }
+}
+
+/* ---------------------------------------------------------
+   Estilos globales / tokens
+--------------------------------------------------------- */
+const GlobalStyle = () => /*#__PURE__*/_jsx("style", {
+  children: `
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600;700&display=swap');
+
+    .fz-root {
+      --bg: #0E1512;
+      --surface: #161F1B;
+      --surface-2: #1E2A24;
+      --border: #2A3830;
+      --text: #EDEFEA;
+      --text-dim: #8FA096;
+      --accent: #37D6A0;
+      --accent-soft: rgba(55,214,160,0.14);
+      --danger: #FF6161;
+      --danger-soft: rgba(255,97,97,0.14);
+      --amber: #F0B429;
+      --amber-soft: rgba(240,180,41,0.14);
+
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      min-height: 100vh;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .fz-root * { box-sizing: border-box; }
+    .fz-display { font-family: 'JetBrains Mono', monospace; font-weight: 600; letter-spacing: -0.02em; }
+    .fz-head { font-family: 'Space Grotesk', sans-serif; font-weight: 600; }
+    .fz-btn {
+      border: none; cursor: pointer; font-family: 'Inter', sans-serif;
+      transition: transform .12s ease, filter .12s ease;
+    }
+    .fz-btn:active { transform: scale(0.97); }
+    .fz-btn:hover { filter: brightness(1.08); }
+    .fz-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+    }
+    @keyframes fz-pulse-red {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,97,97,0.35); }
+      50% { box-shadow: 0 0 0 10px rgba(255,97,97,0); }
+    }
+    @keyframes fz-pulse-green {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(55,214,160,0.30); }
+      50% { box-shadow: 0 0 0 10px rgba(55,214,160,0); }
+    }
+    input[type=number]::-webkit-inner-spin-button { opacity: 0.5; }
+  `
+});
+
+/* ---------------------------------------------------------
+   Componentes pequeños
+--------------------------------------------------------- */
+function TopBar({
+  title,
+  onBack
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      padding: '18px 20px',
+      position: 'sticky',
+      top: 0,
+      background: 'var(--bg)',
+      zIndex: 10,
+      borderBottom: '1px solid var(--border)'
+    },
+    children: [onBack ? /*#__PURE__*/_jsx("button", {
+      className: "fz-btn",
+      onClick: onBack,
+      style: {
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 10,
+        width: 38,
+        height: 38,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: 'var(--text)'
+      },
+      children: /*#__PURE__*/_jsx(ArrowLeft, {
+        size: 18
+      })
+    }) : /*#__PURE__*/_jsx("div", {
+      style: {
+        width: 38,
+        height: 38,
+        borderRadius: 10,
+        background: 'var(--accent-soft)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center'
+      },
+      children: /*#__PURE__*/_jsx(Landmark, {
+        size: 19,
+        color: "var(--accent)"
+      })
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 19
+      },
+      children: title
+    })]
+  });
+}
+function StatCard({
+  label,
+  value,
+  sub,
+  icon: Icon,
+  tone = 'default'
+}) {
+  const toneMap = {
+    default: {
+      bg: 'var(--surface)',
+      accent: 'var(--text-dim)'
+    },
+    good: {
+      bg: 'var(--accent-soft)',
+      accent: 'var(--accent)'
+    },
+    bad: {
+      bg: 'var(--danger-soft)',
+      accent: 'var(--danger)'
+    },
+    warn: {
+      bg: 'var(--amber-soft)',
+      accent: 'var(--amber)'
+    }
+  };
+  const t = toneMap[tone];
+  return /*#__PURE__*/_jsxs("div", {
+    className: "fz-card",
+    style: {
+      padding: '16px 16px',
+      minHeight: 96
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        marginBottom: 8
+      },
+      children: [Icon && /*#__PURE__*/_jsx("div", {
+        style: {
+          width: 26,
+          height: 26,
+          borderRadius: 8,
+          background: t.bg,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center'
+        },
+        children: /*#__PURE__*/_jsx(Icon, {
+          size: 14,
+          color: t.accent
+        })
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 13.5,
+          color: 'var(--text-dim)'
+        },
+        children: label
+      })]
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-display",
+      style: {
+        fontSize: 24
+      },
+      children: value
+    }), sub && /*#__PURE__*/_jsx("div", {
+      style: {
+        fontSize: 12.5,
+        color: 'var(--text-dim)',
+        marginTop: 4
+      },
+      children: sub
+    })]
+  });
+}
+function BigButton({
+  icon: Icon,
+  label,
+  sub,
+  onClick,
+  accent
+}) {
+  return /*#__PURE__*/_jsxs("button", {
+    className: "fz-btn fz-card",
+    onClick: onClick,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 14,
+      padding: '16px 16px',
+      width: '100%',
+      textAlign: 'left',
+      color: 'var(--text)'
+    },
+    children: [/*#__PURE__*/_jsx("div", {
+      style: {
+        width: 46,
+        height: 46,
+        borderRadius: 12,
+        background: accent + '22',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexShrink: 0
+      },
+      children: /*#__PURE__*/_jsx(Icon, {
+        size: 22,
+        color: accent
+      })
+    }), /*#__PURE__*/_jsxs("div", {
+      children: [/*#__PURE__*/_jsx("div", {
+        className: "fz-head",
+        style: {
+          fontSize: 16.5
+        },
+        children: label
+      }), sub && /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 13.5,
+          color: 'var(--text-dim)',
+          marginTop: 2
+        },
+        children: sub
+      })]
+    })]
+  });
+}
+function Field({
+  label,
+  children
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      marginBottom: 16
+    },
+    children: [/*#__PURE__*/_jsx("div", {
+      style: {
+        fontSize: 13,
+        color: 'var(--text-dim)',
+        marginBottom: 6
+      },
+      children: label
+    }), children]
+  });
+}
+const inputStyle = {
+  width: '100%',
+  padding: '12px 14px',
+  borderRadius: 10,
+  border: '1px solid var(--border)',
+  background: 'var(--surface-2)',
+  color: 'var(--text)',
+  fontSize: 15,
+  fontFamily: 'Inter, sans-serif',
+  outline: 'none'
+};
+
+/* ---------------------------------------------------------
+   Vistas
+--------------------------------------------------------- */
+function HomeView({
+  data,
+  setView
+}) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const lastM = m === 0 ? 11 : m - 1;
+  const lastY = m === 0 ? y - 1 : y;
+  const closingDay = data.card.closingDay;
+  const cyc = currentBillingCycle(closingDay, data.card.dueDay);
+  const lastCycM = cyc.m === 0 ? 11 : cyc.m - 1;
+  const lastCycY = cyc.m === 0 ? cyc.y - 1 : cyc.y;
+  const mesActual = gastoDelMesDesglosado(data.purchases, y, m, cyc.y, cyc.m, closingDay);
+  const mesPasado = gastoDelMesDesglosado(data.purchases, lastY, lastM, lastCycY, lastCycM, closingDay);
+  const gastoMesActual = mesActual.total;
+  const gastoMesPasado = mesPasado.total;
+  const deuda = deudaTarjeta(data.purchases, cyc.y, cyc.m, closingDay);
+  const cupoDisp = data.card.limit - deuda;
+  const disponibleReal = data.account.balance - deuda;
+  const {
+    days,
+    date
+  } = nextDueDate(data.card.dueDay || 5);
+  const rojo = days <= 5;
+  const diffPct = gastoMesPasado > 0 ? Math.round((gastoMesActual - gastoMesPasado) / gastoMesPasado * 100) : null;
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 100px'
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      style: {
+        borderRadius: 18,
+        padding: '18px 18px',
+        background: rojo ? 'var(--danger-soft)' : 'var(--accent-soft)',
+        border: `1px solid ${rojo ? 'var(--danger)' : 'var(--accent)'}`,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 14,
+        marginBottom: 18,
+        animation: `${rojo ? 'fz-pulse-red' : 'fz-pulse-green'} 2.4s ease-in-out infinite`
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          width: 44,
+          height: 44,
+          borderRadius: '50%',
+          background: rojo ? 'var(--danger)' : 'var(--accent)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0
+        },
+        children: rojo ? /*#__PURE__*/_jsx(AlertTriangle, {
+          size: 22,
+          color: "#0E1512"
+        }) : /*#__PURE__*/_jsx(CheckCircle2, {
+          size: 22,
+          color: "#0E1512"
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        children: [/*#__PURE__*/_jsx("div", {
+          className: "fz-head",
+          style: {
+            fontSize: 16,
+            color: rojo ? 'var(--danger)' : 'var(--accent)'
+          },
+          children: rojo ? '¡Vencimiento próximo!' : 'Estás al día'
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            fontSize: 13,
+            color: 'var(--text-dim)',
+            marginTop: 2
+          },
+          children: days <= 0 ? 'La tarjeta vence hoy' : `Faltan ${days} día${days === 1 ? '' : 's'} · vence el ${date.getDate()} de ${NOMBRES_MES[date.getMonth()]}`
+        })]
+      })]
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10,
+        marginBottom: 18
+      },
+      children: [/*#__PURE__*/_jsx(StatCard, {
+        label: "Saldo cuenta corriente",
+        value: formatCLP(data.account.balance),
+        icon: Wallet,
+        tone: "default"
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Disponible real",
+        value: formatCLP(disponibleReal),
+        sub: "tras descontar cuotas futuras",
+        icon: BarChart3,
+        tone: disponibleReal < 0 ? 'bad' : 'good'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Usado en tarjeta",
+        value: formatCLP(deuda),
+        sub: `Cupo libre: ${formatCLP(cupoDisp)}`,
+        icon: CreditCard,
+        tone: cupoDisp < 0 ? 'bad' : 'default'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Pr\xF3ximo vencimiento",
+        value: `${date.getDate()} ${NOMBRES_MES[date.getMonth()].slice(0, 3)}`,
+        sub: `en ${days} día${days === 1 ? '' : 's'}`,
+        icon: Calendar,
+        tone: rojo ? 'bad' : 'default'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Comprometido este mes",
+        value: formatCLP(gastoMesActual),
+        sub: `Débito: ${formatCLP(mesActual.debito)} · Tarjeta: ${formatCLP(mesActual.tarjeta)}`,
+        icon: TrendingUp,
+        tone: "default"
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Comprometido mes anterior",
+        value: formatCLP(gastoMesPasado),
+        sub: `Débito: ${formatCLP(mesPasado.debito)} · Tarjeta: ${formatCLP(mesPasado.tarjeta)}`,
+        icon: TrendingDown,
+        tone: "default"
+      })]
+    }), diffPct !== null && /*#__PURE__*/_jsxs("div", {
+      style: {
+        fontSize: 11.5,
+        color: 'var(--text-dim)',
+        marginBottom: 4,
+        padding: '0 4px'
+      },
+      children: [diffPct >= 0 ? '+' : '', diffPct, "% vs. mes pasado"]
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        fontSize: 11.5,
+        color: 'var(--text-dim)',
+        marginBottom: 18,
+        padding: '0 4px'
+      },
+      children: "La parte de tarjeta es lo que corresponde a esa boleta, aunque a\xFAn no la hayas pagado."
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      },
+      children: [/*#__PURE__*/_jsx(BigButton, {
+        icon: Plus,
+        label: "Registrar compra",
+        sub: "Anota un gasto en 30 segundos",
+        accent: "#37D6A0",
+        onClick: () => setView('add')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: Wallet,
+        label: "Movimientos de cuenta corriente",
+        sub: "Registro de todo lo gastado este mes",
+        accent: "#8FA096",
+        onClick: () => setView('movements')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: CreditCard,
+        label: "Ver estado de la tarjeta",
+        sub: "Cupo, deuda y compras activas",
+        accent: "#F0B429",
+        onClick: () => setView('card')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: Calendar,
+        label: "Ver cuotas pendientes",
+        sub: "Todas tus compras en cuotas",
+        accent: "#37D6A0",
+        onClick: () => setView('installments')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: Wallet,
+        label: "Cuentas por pagar del mes",
+        sub: "Lo que se te viene este ciclo",
+        accent: "#F0B429",
+        onClick: () => setView('bills')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: BarChart3,
+        label: "Resumen financiero",
+        sub: "Este mes vs. el anterior",
+        accent: "#37D6A0",
+        onClick: () => setView('summary')
+      }), /*#__PURE__*/_jsx(BigButton, {
+        icon: Settings,
+        label: "Configurar cuenta y tarjeta",
+        sub: "Saldo, cupo y d\xEDa de pago",
+        accent: "#8FA096",
+        onClick: () => setView('settings')
+      })]
+    })]
+  });
+}
+function AddPurchaseView({
+  data,
+  updateData,
+  setView
+}) {
+  const [desc, setDesc] = useState('');
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayISO());
+  const [method, setMethod] = useState('debito');
+  const [installments, setInstallments] = useState('1');
+  const canSave = desc.trim() && Number(amount) > 0;
+  const save = () => {
+    if (!canSave) return;
+    const purchase = {
+      id: Date.now().toString(),
+      desc: desc.trim(),
+      amount: Number(amount),
+      date,
+      method,
+      installments: method === 'credito' ? Math.max(1, Number(installments) || 1) : 1
+    };
+    const next = {
+      ...data,
+      purchases: [purchase, ...data.purchases]
+    };
+    if (method === 'debito') {
+      next.account = {
+        ...data.account,
+        balance: data.account.balance - Number(amount)
+      };
+    }
+    updateData(next);
+    setView('home');
+  };
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsx(Field, {
+      label: "\xBFQu\xE9 compraste?",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        placeholder: "Ej: Supermercado, bencina, arriendo\u2026",
+        value: desc,
+        onChange: e => setDesc(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx(Field, {
+      label: "Monto total",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        placeholder: "0",
+        value: amount,
+        onChange: e => setAmount(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx(Field, {
+      label: "Fecha",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "date",
+        value: date,
+        onChange: e => setDate(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx(Field, {
+      label: "Medio de pago",
+      children: /*#__PURE__*/_jsx("div", {
+        style: {
+          display: 'flex',
+          gap: 10
+        },
+        children: [{
+          id: 'debito',
+          label: 'Cuenta corriente'
+        }, {
+          id: 'credito',
+          label: 'Tarjeta de crédito'
+        }].map(opt => /*#__PURE__*/_jsx("button", {
+          className: "fz-btn",
+          onClick: () => setMethod(opt.id),
+          style: {
+            flex: 1,
+            padding: '12px 10px',
+            borderRadius: 10,
+            border: `1px solid ${method === opt.id ? 'var(--accent)' : 'var(--border)'}`,
+            background: method === opt.id ? 'var(--accent-soft)' : 'var(--surface-2)',
+            color: method === opt.id ? 'var(--accent)' : 'var(--text)',
+            fontSize: 13.5
+          },
+          children: opt.label
+        }, opt.id))
+      })
+    }), method === 'credito' && /*#__PURE__*/_jsx(Field, {
+      label: "N\xFAmero de cuotas",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        min: "1",
+        value: installments,
+        onChange: e => setInstallments(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx("button", {
+      className: "fz-btn",
+      onClick: save,
+      disabled: !canSave,
+      style: {
+        width: '100%',
+        padding: '16px',
+        borderRadius: 12,
+        marginTop: 8,
+        background: canSave ? 'var(--accent)' : 'var(--surface-2)',
+        color: canSave ? '#0E1512' : 'var(--text-dim)',
+        fontSize: 16,
+        fontWeight: 600
+      },
+      children: "Guardar compra"
+    })]
+  });
+}
+function MovementsView({
+  data,
+  updateData
+}) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const movimientos = data.purchases.filter(p => p.method === 'debito').filter(p => {
+    const {
+      y: py,
+      m: pm
+    } = parseDate(p.date);
+    return py === y && pm === m;
+  }).sort((a, b) => b.date.localeCompare(a.date));
+  const total = movimientos.reduce((s, p) => s + p.amount, 0);
+  const remove = id => updateData({
+    ...data,
+    purchases: data.purchases.filter(p => p.id !== id)
+  });
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      className: "fz-card",
+      style: {
+        padding: 20,
+        marginBottom: 18
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--text-dim)',
+          marginBottom: 4
+        },
+        children: "Total gastado este mes (cuenta corriente)"
+      }), /*#__PURE__*/_jsx("div", {
+        className: "fz-display",
+        style: {
+          fontSize: 28
+        },
+        children: formatCLP(total)
+      })]
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 15,
+        marginBottom: 10
+      },
+      children: "Movimientos del mes"
+    }), movimientos.length === 0 && /*#__PURE__*/_jsx("div", {
+      style: {
+        color: 'var(--text-dim)',
+        fontSize: 13.5
+      },
+      children: "A\xFAn no registras gastos de cuenta corriente este mes."
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8
+      },
+      children: movimientos.map(p => /*#__PURE__*/_jsxs("div", {
+        className: "fz-card",
+        style: {
+          padding: 14,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center'
+        },
+        children: [/*#__PURE__*/_jsxs("div", {
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              fontSize: 14,
+              fontWeight: 500
+            },
+            children: p.desc
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              fontSize: 12,
+              color: 'var(--text-dim)',
+              marginTop: 3
+            },
+            children: p.date.split('-').reverse().join('/')
+          })]
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            className: "fz-display",
+            style: {
+              fontSize: 14
+            },
+            children: formatCLP(p.amount)
+          }), /*#__PURE__*/_jsx("button", {
+            className: "fz-btn",
+            onClick: () => remove(p.id),
+            style: {
+              background: 'transparent',
+              color: 'var(--text-dim)',
+              padding: 6
+            },
+            children: /*#__PURE__*/_jsx(Trash2, {
+              size: 16
+            })
+          })]
+        })]
+      }, p.id))
+    })]
+  });
+}
+function CardView({
+  data,
+  updateData
+}) {
+  const closingDay = data.card.closingDay;
+  const {
+    y,
+    m
+  } = currentBillingCycle(closingDay, data.card.dueDay);
+  const deuda = deudaTarjeta(data.purchases, y, m, closingDay);
+  const cupoDisp = data.card.limit - deuda;
+  const pct = data.card.limit > 0 ? Math.min(100, Math.round(deuda / data.card.limit * 100)) : 0;
+  const {
+    days,
+    date
+  } = nextDueDate(data.card.dueDay || 5);
+  const activas = data.purchases.filter(p => {
+    if (p.method !== 'credito') return false;
+    const info = installmentInfo(p, y, m, closingDay);
+    const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+    return info.n - pagadas > 0;
+  });
+  const remove = id => updateData({
+    ...data,
+    purchases: data.purchases.filter(p => p.id !== id)
+  });
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      className: "fz-card",
+      style: {
+        padding: 20,
+        marginBottom: 18
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 14,
+          color: 'var(--text-dim)',
+          marginBottom: 4
+        },
+        children: "Usado del cupo"
+      }), /*#__PURE__*/_jsx("div", {
+        className: "fz-display",
+        style: {
+          fontSize: 32,
+          marginBottom: 10
+        },
+        children: formatCLP(deuda)
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          height: 8,
+          borderRadius: 6,
+          background: 'var(--surface-2)',
+          overflow: 'hidden',
+          marginBottom: 8
+        },
+        children: /*#__PURE__*/_jsx("div", {
+          style: {
+            height: '100%',
+            width: `${pct}%`,
+            background: pct > 85 ? 'var(--danger)' : pct > 60 ? 'var(--amber)' : 'var(--accent)'
+          }
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: 'flex',
+          justifyContent: 'space-between',
+          fontSize: 12.5,
+          color: 'var(--text-dim)'
+        },
+        children: [/*#__PURE__*/_jsxs("span", {
+          children: ["Cupo total: ", formatCLP(data.card.limit)]
+        }), /*#__PURE__*/_jsxs("span", {
+          children: ["Disponible: ", formatCLP(cupoDisp)]
+        })]
+      })]
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10,
+        marginBottom: 20
+      },
+      children: [/*#__PURE__*/_jsx(StatCard, {
+        label: "Pr\xF3ximo vencimiento",
+        value: `${date.getDate()} ${NOMBRES_MES[date.getMonth()].slice(0, 3)}`,
+        icon: Calendar,
+        tone: days <= 5 ? 'bad' : 'default'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "D\xEDas restantes",
+        value: days,
+        icon: AlertTriangle,
+        tone: days <= 5 ? 'bad' : 'good'
+      })]
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 15,
+        marginBottom: 10
+      },
+      children: "Compras activas en la tarjeta"
+    }), activas.length === 0 && /*#__PURE__*/_jsx("div", {
+      style: {
+        color: 'var(--text-dim)',
+        fontSize: 13.5
+      },
+      children: "No tienes compras a cr\xE9dito pendientes."
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8
+      },
+      children: activas.map(p => {
+        const info = installmentInfo(p, y, m, closingDay);
+        return /*#__PURE__*/_jsxs("div", {
+          className: "fz-card",
+          style: {
+            padding: 14,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center'
+          },
+          children: [/*#__PURE__*/_jsxs("div", {
+            children: [/*#__PURE__*/_jsx("div", {
+              style: {
+                fontSize: 16,
+                fontWeight: 500
+              },
+              children: p.desc
+            }), /*#__PURE__*/_jsxs("div", {
+              style: {
+                fontSize: 13.5,
+                color: 'var(--text-dim)',
+                marginTop: 3
+              },
+              children: ["Cuota ", Math.min(info.cuotaNumber, info.n), " de ", info.n, " \xB7 ", formatCLP(info.cuotaAmount), "/mes"]
+            }), /*#__PURE__*/_jsxs("div", {
+              style: {
+                fontSize: 12.5,
+                color: 'var(--text-dim)',
+                marginTop: 2
+              },
+              children: ["Comprado el ", p.date.split('-').reverse().join('/')]
+            })]
+          }), /*#__PURE__*/_jsx("button", {
+            className: "fz-btn",
+            onClick: () => remove(p.id),
+            style: {
+              background: 'transparent',
+              color: 'var(--text-dim)',
+              padding: 6
+            },
+            children: /*#__PURE__*/_jsx(Trash2, {
+              size: 16
+            })
+          })]
+        }, p.id);
+      })
+    })]
+  });
+}
+function InstallmentsView({
+  data,
+  updateData
+}) {
+  const closingDay = data.card.closingDay;
+  const {
+    y,
+    m
+  } = currentBillingCycle(closingDay, data.card.dueDay);
+  const creditos = data.purchases.filter(p => p.method === 'credito');
+  const remove = id => updateData({
+    ...data,
+    purchases: data.purchases.filter(p => p.id !== id)
+  });
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [creditos.length === 0 && /*#__PURE__*/_jsx("div", {
+      style: {
+        color: 'var(--text-dim)',
+        fontSize: 13.5,
+        textAlign: 'center',
+        marginTop: 40
+      },
+      children: "A\xFAn no registras compras en cuotas."
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10
+      },
+      children: creditos.map(p => {
+        const info = installmentInfo(p, y, m, closingDay);
+        const pagadas = Math.min(Math.max(info.elapsed, 0), info.n);
+        const restantes = info.n - pagadas;
+        const pct = Math.round(pagadas / info.n * 100);
+        return /*#__PURE__*/_jsxs("div", {
+          className: "fz-card",
+          style: {
+            padding: 16
+          },
+          children: [/*#__PURE__*/_jsxs("div", {
+            style: {
+              display: 'flex',
+              justifyContent: 'space-between',
+              marginBottom: 8
+            },
+            children: [/*#__PURE__*/_jsxs("div", {
+              children: [/*#__PURE__*/_jsx("div", {
+                style: {
+                  fontSize: 16,
+                  fontWeight: 500
+                },
+                children: p.desc
+              }), /*#__PURE__*/_jsxs("div", {
+                style: {
+                  fontSize: 13.5,
+                  color: 'var(--text-dim)',
+                  marginTop: 2
+                },
+                children: [formatCLP(p.amount), " total \xB7 ", formatCLP(info.cuotaAmount), "/cuota"]
+              }), /*#__PURE__*/_jsxs("div", {
+                style: {
+                  fontSize: 12.5,
+                  color: 'var(--text-dim)',
+                  marginTop: 2
+                },
+                children: ["Comprado el ", p.date.split('-').reverse().join('/')]
+              })]
+            }), /*#__PURE__*/_jsx("button", {
+              className: "fz-btn",
+              onClick: () => remove(p.id),
+              style: {
+                background: 'transparent',
+                color: 'var(--text-dim)',
+                padding: 6,
+                height: 'fit-content'
+              },
+              children: /*#__PURE__*/_jsx(Trash2, {
+                size: 16
+              })
+            })]
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              height: 7,
+              borderRadius: 5,
+              background: 'var(--surface-2)',
+              overflow: 'hidden',
+              marginBottom: 6
+            },
+            children: /*#__PURE__*/_jsx("div", {
+              style: {
+                height: '100%',
+                width: `${pct}%`,
+                background: restantes === 0 ? 'var(--accent)' : 'var(--amber)'
+              }
+            })
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              fontSize: 13,
+              color: 'var(--text-dim)'
+            },
+            children: restantes === 0 ? 'Pagada por completo' : `${pagadas} de ${info.n} cuotas pagadas · quedan ${restantes}`
+          })]
+        }, p.id);
+      })
+    })]
+  });
+}
+function proyeccionMeses(purchases, closingDay, dueDay, cantidadMeses) {
+  const start = currentBillingCycle(closingDay, dueDay);
+  const meses = [];
+  for (let i = 0; i < cantidadMeses; i++) {
+    let y = start.y;
+    let m = start.m + i;
+    while (m > 11) {
+      m -= 12;
+      y += 1;
+    }
+    const total = purchases.filter(p => p.method === 'credito').reduce((s, p) => {
+      const info = installmentInfo(p, y, m, closingDay);
+      return s + (info.active ? info.cuotaAmount : 0);
+    }, 0);
+    meses.push({
+      y,
+      m,
+      total
+    });
+  }
+  return meses;
+}
+function BillsView({
+  data
+}) {
+  const closingDay = data.card.closingDay;
+  const {
+    y,
+    m
+  } = currentBillingCycle(closingDay, data.card.dueDay);
+  const {
+    days,
+    date
+  } = nextDueDate(data.card.dueDay || 5);
+  const items = data.purchases.filter(p => p.method === 'credito' && installmentInfo(p, y, m, closingDay).active).map(p => ({
+    p,
+    info: installmentInfo(p, y, m, closingDay)
+  }));
+  const totalTarjeta = items.reduce((s, it) => s + it.info.cuotaAmount, 0);
+  const proyeccion = proyeccionMeses(data.purchases, closingDay, data.card.dueDay, 4);
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      className: "fz-card",
+      style: {
+        padding: 20,
+        marginBottom: 20,
+        border: `1px solid ${days <= 5 ? 'var(--danger)' : 'var(--border)'}`
+      },
+      children: [/*#__PURE__*/_jsxs("div", {
+        style: {
+          fontSize: 13,
+          color: 'var(--text-dim)',
+          marginBottom: 4
+        },
+        children: ["Total a pagar el ", date.getDate(), " de ", NOMBRES_MES[date.getMonth()]]
+      }), /*#__PURE__*/_jsx("div", {
+        className: "fz-display",
+        style: {
+          fontSize: 30,
+          color: days <= 5 ? 'var(--danger)' : 'var(--text)'
+        },
+        children: formatCLP(totalTarjeta)
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          fontSize: 12.5,
+          color: 'var(--text-dim)',
+          marginTop: 4
+        },
+        children: ["Faltan ", days, " d\xEDa", days === 1 ? '' : 's', " para el vencimiento"]
+      })]
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 15,
+        marginBottom: 10
+      },
+      children: "Pr\xF3ximos 4 meses"
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-card",
+      style: {
+        padding: 14,
+        marginBottom: 20,
+        display: 'flex',
+        justifyContent: 'space-between'
+      },
+      children: proyeccion.map((pm, idx) => /*#__PURE__*/_jsxs("div", {
+        style: {
+          textAlign: 'center',
+          flex: 1
+        },
+        children: [/*#__PURE__*/_jsx("div", {
+          style: {
+            fontSize: 11.5,
+            color: 'var(--text-dim)',
+            marginBottom: 6,
+            textTransform: 'capitalize'
+          },
+          children: NOMBRES_MES[pm.m].slice(0, 3)
+        }), /*#__PURE__*/_jsx("div", {
+          className: "fz-display",
+          style: {
+            fontSize: 12.5
+          },
+          children: formatCLP(pm.total)
+        })]
+      }, idx))
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 15,
+        marginBottom: 10
+      },
+      children: "Detalle del cargo"
+    }), items.length === 0 && /*#__PURE__*/_jsx("div", {
+      style: {
+        color: 'var(--text-dim)',
+        fontSize: 13.5
+      },
+      children: "No tienes cuotas de tarjeta este mes."
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8
+      },
+      children: items.map(({
+        p,
+        info
+      }) => /*#__PURE__*/_jsxs("div", {
+        className: "fz-card",
+        style: {
+          padding: 14,
+          display: 'flex',
+          justifyContent: 'space-between'
+        },
+        children: [/*#__PURE__*/_jsx("div", {
+          style: {
+            fontSize: 14
+          },
+          children: p.desc
+        }), /*#__PURE__*/_jsx("div", {
+          className: "fz-display",
+          style: {
+            fontSize: 14
+          },
+          children: formatCLP(info.cuotaAmount)
+        })]
+      }, p.id))
+    })]
+  });
+}
+function SummaryView({
+  data
+}) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const lastM = m === 0 ? 11 : m - 1;
+  const lastY = m === 0 ? y - 1 : y;
+  const closingDay = data.card.closingDay;
+  const cyc = currentBillingCycle(closingDay, data.card.dueDay);
+  const lastCycM = cyc.m === 0 ? 11 : cyc.m - 1;
+  const lastCycY = cyc.m === 0 ? cyc.y - 1 : cyc.y;
+  const actual = gastoDelMes(data.purchases, y, m, cyc.y, cyc.m, closingDay);
+  const pasado = gastoDelMes(data.purchases, lastY, lastM, lastCycY, lastCycM, closingDay);
+  const deuda = deudaTarjeta(data.purchases, cyc.y, cyc.m, closingDay);
+  const disponibleReal = data.account.balance - deuda;
+  const maxVal = Math.max(actual, pasado, 1);
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      className: "fz-card",
+      style: {
+        padding: 20,
+        marginBottom: 18
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        className: "fz-head",
+        style: {
+          fontSize: 14,
+          marginBottom: 16,
+          color: 'var(--text-dim)'
+        },
+        children: "Gasto mensual comparado"
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: 'flex',
+          alignItems: 'flex-end',
+          gap: 24,
+          height: 140,
+          marginBottom: 8
+        },
+        children: [/*#__PURE__*/_jsxs("div", {
+          style: {
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 8
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            className: "fz-display",
+            style: {
+              fontSize: 12.5,
+              color: 'var(--text-dim)'
+            },
+            children: formatCLP(pasado)
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              width: '55%',
+              height: `${Math.max(6, pasado / maxVal * 100)}px`,
+              background: 'var(--surface-2)',
+              borderRadius: '6px 6px 0 0'
+            }
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              fontSize: 12,
+              color: 'var(--text-dim)'
+            },
+            children: NOMBRES_MES[lastM].slice(0, 3)
+          })]
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 8
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            className: "fz-display",
+            style: {
+              fontSize: 12.5,
+              color: 'var(--accent)'
+            },
+            children: formatCLP(actual)
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              width: '55%',
+              height: `${Math.max(6, actual / maxVal * 100)}px`,
+              background: 'var(--accent)',
+              borderRadius: '6px 6px 0 0'
+            }
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              fontSize: 12,
+              color: 'var(--text-dim)'
+            },
+            children: NOMBRES_MES[m].slice(0, 3)
+          })]
+        })]
+      })]
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 10
+      },
+      children: [/*#__PURE__*/_jsx(StatCard, {
+        label: "Saldo actual",
+        value: formatCLP(data.account.balance),
+        icon: Wallet
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Deuda en tarjeta",
+        value: formatCLP(deuda),
+        icon: CreditCard,
+        tone: deuda > 0 ? 'warn' : 'default'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Disponible real",
+        value: formatCLP(disponibleReal),
+        icon: BarChart3,
+        tone: disponibleReal < 0 ? 'bad' : 'good'
+      }), /*#__PURE__*/_jsx(StatCard, {
+        label: "Variaci\xF3n mensual",
+        value: pasado > 0 ? `${Math.round((actual - pasado) / pasado * 100)}%` : '—',
+        icon: actual >= pasado ? TrendingUp : TrendingDown,
+        tone: actual > pasado ? 'bad' : 'good'
+      })]
+    })]
+  });
+}
+function SettingsView({
+  data,
+  updateData,
+  setView
+}) {
+  const [balance, setBalance] = useState(String(data.account.balance || ''));
+  const [limit, setLimit] = useState(String(data.card.limit || ''));
+  const [closingDay, setClosingDay] = useState(String(data.card.closingDay || ''));
+  const [dueDay, setDueDay] = useState(String(data.card.dueDay || 5));
+  const [importMsg, setImportMsg] = useState('');
+  const fileInputRef = useRef(null);
+  const save = () => {
+    updateData({
+      ...data,
+      account: {
+        balance: Number(balance) || 0
+      },
+      card: {
+        limit: Number(limit) || 0,
+        closingDay: closingDay ? Math.min(31, Math.max(1, Number(closingDay))) : null,
+        dueDay: Math.min(28, Math.max(1, Number(dueDay) || 1))
+      }
+    });
+    setView('home');
+  };
+  const exportarDatos = () => {
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: 'application/json'
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `finanzas-respaldo-${todayISO()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setImportMsg('No se pudo generar el respaldo.');
+    }
+  };
+  const importarDatos = e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        if (parsed && parsed.account && parsed.card && Array.isArray(parsed.purchases)) {
+          updateData(parsed);
+          setBalance(String(parsed.account.balance || ''));
+          setLimit(String(parsed.card.limit || ''));
+          setClosingDay(String(parsed.card.closingDay || ''));
+          setDueDay(String(parsed.card.dueDay || 5));
+          setImportMsg('Datos restaurados correctamente.');
+        } else {
+          setImportMsg('El archivo no tiene el formato esperado.');
+        }
+      } catch (err) {
+        setImportMsg('No se pudo leer el archivo. ¿Es un respaldo válido?');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: '18px 16px 40px'
+    },
+    children: [/*#__PURE__*/_jsx(Field, {
+      label: "Saldo actual de tu cuenta corriente",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        value: balance,
+        onChange: e => setBalance(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx(Field, {
+      label: "Cupo total de tu tarjeta de cr\xE9dito",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        value: limit,
+        onChange: e => setLimit(e.target.value)
+      })
+    }), /*#__PURE__*/_jsxs(Field, {
+      label: "D\xEDa de cierre de facturaci\xF3n (opcional)",
+      children: [/*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        min: "1",
+        max: "31",
+        placeholder: "Ej: 20",
+        value: closingDay,
+        onChange: e => setClosingDay(e.target.value)
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 12,
+          color: 'var(--text-dim)',
+          marginTop: 6
+        },
+        children: "Las compras hechas despu\xE9s de este d\xEDa se agrupan en la boleta del mes siguiente. Si lo dejas vac\xEDo, usamos el 28 como referencia. Puede variar 1 o 2 d\xEDas seg\xFAn el mes (feriados, fines de semana); si notas una diferencia, aj\xFAstalo aqu\xED con el d\xEDa exacto de tu cartola."
+      })]
+    }), /*#__PURE__*/_jsx(Field, {
+      label: "D\xEDa del mes en que vence el pago",
+      children: /*#__PURE__*/_jsx("input", {
+        style: inputStyle,
+        type: "number",
+        inputMode: "numeric",
+        min: "1",
+        max: "28",
+        value: dueDay,
+        onChange: e => setDueDay(e.target.value)
+      })
+    }), /*#__PURE__*/_jsx("button", {
+      className: "fz-btn",
+      onClick: save,
+      style: {
+        width: '100%',
+        padding: '16px',
+        borderRadius: 12,
+        marginTop: 8,
+        background: 'var(--accent)',
+        color: '#0E1512',
+        fontSize: 16,
+        fontWeight: 600
+      },
+      children: "Guardar cambios"
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        height: 1,
+        background: 'var(--border)',
+        margin: '28px 0 20px'
+      }
+    }), /*#__PURE__*/_jsx("div", {
+      className: "fz-head",
+      style: {
+        fontSize: 15,
+        marginBottom: 6
+      },
+      children: "Respaldo de tus datos"
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        fontSize: 12.5,
+        color: 'var(--text-dim)',
+        marginBottom: 14
+      },
+      children: "Descarga una copia de toda tu informaci\xF3n (saldo, tarjeta y compras) y gu\xE1rdala en un lugar seguro. Si alg\xFAn d\xEDa se borran los datos del celular, puedes restaurarlos desde ese archivo."
+    }), /*#__PURE__*/_jsx("button", {
+      className: "fz-btn fz-card",
+      onClick: exportarDatos,
+      style: {
+        width: '100%',
+        padding: '14px',
+        borderRadius: 12,
+        marginBottom: 10,
+        color: 'var(--text)',
+        fontSize: 14.5,
+        fontWeight: 500
+      },
+      children: "Respaldar mis datos (descargar copia)"
+    }), /*#__PURE__*/_jsx("input", {
+      ref: fileInputRef,
+      type: "file",
+      accept: "application/json",
+      onChange: importarDatos,
+      style: {
+        display: 'none'
+      }
+    }), /*#__PURE__*/_jsx("button", {
+      className: "fz-btn fz-card",
+      onClick: () => fileInputRef.current && fileInputRef.current.click(),
+      style: {
+        width: '100%',
+        padding: '14px',
+        borderRadius: 12,
+        color: 'var(--text)',
+        fontSize: 14.5,
+        fontWeight: 500
+      },
+      children: "Restaurar desde un respaldo"
+    }), importMsg && /*#__PURE__*/_jsx("div", {
+      style: {
+        fontSize: 12.5,
+        color: 'var(--accent)',
+        marginTop: 10
+      },
+      children: importMsg
+    })]
+  });
+}
+
+/* ---------------------------------------------------------
+   App principal
+--------------------------------------------------------- */
+const VIEW_TITLES = {
+  home: 'Mis finanzas',
+  add: 'Registrar compra',
+  movements: 'Cuenta corriente',
+  card: 'Estado de la tarjeta',
+  installments: 'Cuotas pendientes',
+  bills: 'Cuentas por pagar',
+  summary: 'Resumen financiero',
+  settings: 'Configuración'
+};
+function FinanzasApp() {
+  const [data, setData] = useState(defaultData);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState('home');
+  const [needsSetup, setNeedsSetup] = useState(false);
+  useEffect(() => {
+    (async () => {
+      const parsed = await loadData();
+      if (parsed) {
+        setData({
+          ...defaultData,
+          ...parsed
+        });
+      } else {
+        setNeedsSetup(true);
+      }
+      setLoading(false);
+    })();
+  }, []);
+  const updateData = useCallback(async next => {
+    setData(next);
+    await saveData(next);
+  }, []);
+  if (loading) {
+    return /*#__PURE__*/_jsxs("div", {
+      className: "fz-root",
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '100vh'
+      },
+      children: [/*#__PURE__*/_jsx(GlobalStyle, {}), /*#__PURE__*/_jsx("div", {
+        style: {
+          color: 'var(--text-dim)',
+          fontSize: 14
+        },
+        children: "Cargando\u2026"
+      })]
+    });
+  }
+  return /*#__PURE__*/_jsxs("div", {
+    className: "fz-root",
+    style: {
+      width: '100%',
+      position: 'relative',
+      zoom: 1.55
+    },
+    children: [/*#__PURE__*/_jsx(GlobalStyle, {}), /*#__PURE__*/_jsx(TopBar, {
+      title: VIEW_TITLES[view],
+      onBack: view !== 'home' ? () => setView('home') : null
+    }), needsSetup && view === 'home' && /*#__PURE__*/_jsx("div", {
+      style: {
+        padding: '14px 16px 0'
+      },
+      children: /*#__PURE__*/_jsxs("div", {
+        className: "fz-card",
+        style: {
+          padding: 14,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          border: '1px solid var(--amber)',
+          background: 'var(--amber-soft)'
+        },
+        children: [/*#__PURE__*/_jsx(AlertTriangle, {
+          size: 18,
+          color: "var(--amber)"
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            fontSize: 13
+          },
+          children: ["Configura tu saldo y tu tarjeta para empezar.", ' ', /*#__PURE__*/_jsx("button", {
+            className: "fz-btn",
+            onClick: () => {
+              setNeedsSetup(false);
+              setView('settings');
+            },
+            style: {
+              background: 'transparent',
+              color: 'var(--amber)',
+              textDecoration: 'underline',
+              padding: 0,
+              fontSize: 13
+            },
+            children: "Ir a configuraci\xF3n"
+          })]
+        })]
+      })
+    }), view === 'home' && /*#__PURE__*/_jsx(HomeView, {
+      data: data,
+      setView: setView
+    }), view === 'add' && /*#__PURE__*/_jsx(AddPurchaseView, {
+      data: data,
+      updateData: updateData,
+      setView: setView
+    }), view === 'movements' && /*#__PURE__*/_jsx(MovementsView, {
+      data: data,
+      updateData: updateData
+    }), view === 'card' && /*#__PURE__*/_jsx(CardView, {
+      data: data,
+      updateData: updateData
+    }), view === 'installments' && /*#__PURE__*/_jsx(InstallmentsView, {
+      data: data,
+      updateData: updateData
+    }), view === 'bills' && /*#__PURE__*/_jsx(BillsView, {
+      data: data
+    }), view === 'summary' && /*#__PURE__*/_jsx(SummaryView, {
+      data: data
+    }), view === 'settings' && /*#__PURE__*/_jsx(SettingsView, {
+      data: data,
+      updateData: updateData,
+      setView: setView
+    })]
+  });
+}
+createRoot(document.getElementById('root')).render(/*#__PURE__*/_jsx(FinanzasApp, {}));
+</script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
